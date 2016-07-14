@@ -4,6 +4,7 @@ import java.io.{PrintWriter, File}
 import java.text.SimpleDateFormat
 import java.util.{Date, Calendar}
 
+import scala.math.{min, max, log}
 import org.apache.spark.mllib.classification.{LogisticRegressionModel, LogisticRegressionWithLBFGS}
 import org.apache.spark.mllib.evaluation.MulticlassMetrics
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
@@ -44,15 +45,13 @@ object SparkNumeraiRddJob {
     }.cache()
 
     // split data
-    val split = 0.9
+    val split = 0.7
     val splits = trainData.randomSplit(Array(split, 1 - split), seed = 11L)
     val train = splits(0).cache()
     val test = splits(1)
 
     trainLRModel(testData, train, test)
     //trainGBCModel(testData, train, test)
-
-    println(TODAY)
   }
 
   def trainLRModel(testData: RDD[LabeledPoint], train: RDD[LabeledPoint], test: RDD[LabeledPoint]) = {
@@ -77,6 +76,22 @@ object SparkNumeraiRddJob {
 
     //extract probabilities
     lrModel.clearThreshold()
+
+    //log loss
+    var loss = 0.0
+    val maxmin = (p:Double) => max(min(p, 1.0 - 1e-5), 1e-5)
+    val logloss = (p:Double, y:Double) => - ( y * log( maxmin(p) ) + (1-y) * log( 1 - maxmin(p) ) )
+    var train_count = 1
+
+    // Check log loss on training dataset
+    val predictedTrainData = test.map { case LabeledPoint(label, features) =>
+      val prediction = lrModel.predict(features)
+      loss += logloss(prediction, label)
+      train_count += 1
+      println("train_count: " + train_count + " logloss: " + logloss(prediction, label) + " loss: " + loss + " total loss: " + loss/train_count)
+      (label, prediction)
+    }
+    predictedTrainData.count()
 
     //make submission
     val submission = testData.map { point =>
