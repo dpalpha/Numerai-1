@@ -3,17 +3,21 @@ package com.algonell.numerai
 import java.io.{File, PrintWriter}
 
 import org.apache.spark.ml.attribute.{Attribute, AttributeGroup, NumericAttribute}
-import org.apache.spark.ml.feature.VectorSlicer
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.feature.{VectorAssembler, VectorSlicer}
 import org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS
-import org.apache.spark.mllib.evaluation.MulticlassMetrics
+import org.apache.spark.mllib.evaluation.{BinaryClassificationMetrics, MulticlassMetrics}
 import org.apache.spark.mllib.linalg.{Vector, Vectors}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.GradientBoostedTrees
 import org.apache.spark.mllib.tree.configuration.BoostingStrategy
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.types.StructType
-import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.sql.types.{DoubleType, StructType}
+import org.apache.spark.sql._
 import org.apache.spark.{SparkConf, SparkContext}
+
+import scala.collection.mutable.ArrayBuffer
 
 /**
   * Created by andrewkreimer on 6/28/16.
@@ -21,53 +25,86 @@ import org.apache.spark.{SparkConf, SparkContext}
 object SparkNumeraiDataFrameJob {
   def main(args: Array[String]) {
     //configure Spark
-    val conf = new SparkConf().setAppName("Numerai Spark").setMaster("local[*]")
-    val sc = new SparkContext(conf)
-    val sqlContext = new SQLContext(sc)
-
-    val data = Array(Row(Vectors.dense(-2.0, 2.3, 0.0)))
-
-    val defaultAttr = NumericAttribute.defaultAttr
-    val attrs = Array("f1", "f2", "f3").map(defaultAttr.withName)
-    val attrGroup = new AttributeGroup("userFeatures", attrs.asInstanceOf[Array[Attribute]])
-
-    val dataRDD = sc.parallelize(data)
-    val dataset = sqlContext.createDataFrame(dataRDD, StructType(Array(attrGroup.toStructField())))
-
-    val slicer = new VectorSlicer().setInputCol("userFeatures").setOutputCol("features")
-
-    slicer.setIndices(Array(1)).setNames(Array("f3"))
-    // or slicer.setIndices(Array(1, 2)), or slicer.setNames(Array("f2", "f3"))
-
-    val output = slicer.transform(dataset)
-    println(output.select("userFeatures", "features").first())
+    val spark = SparkSession.builder().appName("Spark SQL Example").master("local[*]").getOrCreate()
 
     //load train data
-    val trainDataFile = sc.textFile("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_training_data.txt")
-    val trainData = trainDataFile.map { line =>
-      val parts = line.split(',')
-      val target: Double = parts(parts.length - 1).toDouble
-      val features: Vector = Vectors.dense(parts.slice(0, parts.length - 2).map(_.toDouble))
-      LabeledPoint(target, features)
-    }.cache()
+    var trainData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_training_data.csv")
+
+    //convert to LabeledPoint structure
+    val cols = Array.ofDim[String](trainData.columns.length - 1)
+    Array.copy(trainData.columns, 0, cols, 0, trainData.columns.length - 1)
+    trainData = new VectorAssembler().setInputCols(cols).setOutputCol("features").transform(trainData)
+
+    //drop unused cols
+    cols.foreach(col =>
+      trainData = trainData.drop(col)
+    )
+
+    //rename class variable
+    trainData = trainData.withColumnRenamed("target", "label")
+
+    //show train
+    trainData.show()
 
     //load test data
-    val testDataFile = sc.textFile("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_tournament_data.txt")
-    val testData = testDataFile.map { line =>
-      val parts = line.split(',')
-      val id: Double = parts(0).toDouble
-      val features: Vector = Vectors.dense(parts.slice(1, parts.length - 1).map(_.toDouble))
-      LabeledPoint(id, features)
-    }.cache()
+    var testData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_tournament_data.csv")
+
+    //convert to LabeledPoint structure
+    testData = new VectorAssembler().setInputCols(cols).setOutputCol("features").transform(testData)
+
+    //drop unused cols
+    cols.foreach(col =>
+      testData = testData.drop(col)
+    )
+
+    //show test
+    testData.show()
 
     // split data
     val split = 0.9
     val splits = trainData.randomSplit(Array(split, 1 - split), seed = 11L)
+
     val train = splits(0).cache()
     val test = splits(1)
 
-    trainLRModel(testData, train, test)
-    trainGBCModel(testData, train, test)
+    val lr = new LogisticRegression()
+      .setFeaturesCol("features")
+      .setLabelCol("label")
+      .setMaxIter(10)
+      .setRegParam(0.3)
+      .setElasticNetParam(0.8)
+
+    // Fit the model
+    val model = lr.fit(train)
+
+    // Print the coefficients and intercept for logistic regression
+    println(s"Coefficients: ${model.coefficients} Intercept: ${model.intercept}")
+
+    // Compute raw scores on the test set
+    val predictions = model.transform(test)
+
+    // Instantiate metrics object
+    // Select example rows to display.
+    predictions.select("prediction", "label", "features").show(5)
+
+    // Select (prediction, true label) and compute test error.
+    val evaluator = new MulticlassClassificationEvaluator()
+      .setLabelCol("label")
+      .setPredictionCol("prediction")
+      .setMetricName("accuracy")
+    val accuracy = evaluator.evaluate(predictions)
+    println("Test Error = " + (1.0 - accuracy))
+  }
+
+  //convert df to numbers
+  def toNumbers(df: DataFrame):DataFrame = {
+    df.columns.foreach(col =>
+      df.withColumn(col, df.col(col).cast(DoubleType))
+      .drop(col)
+      .withColumnRenamed(col, col)
+    )
+
+    df
   }
 
   def trainLRModel(testData: RDD[LabeledPoint], train: RDD[LabeledPoint], test: RDD[LabeledPoint]) = {
