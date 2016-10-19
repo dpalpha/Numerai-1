@@ -1,34 +1,116 @@
 package com.algonell.numerai
 
-import java.io.{File, PrintWriter}
-
-import org.apache.spark.ml.attribute.{Attribute, AttributeGroup, NumericAttribute}
-import org.apache.spark.ml.classification.LogisticRegression
-import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
-import org.apache.spark.ml.feature.{VectorAssembler, VectorSlicer}
-import org.apache.spark.mllib.classification.LogisticRegressionWithLBFGS
-import org.apache.spark.mllib.evaluation.{BinaryClassificationMetrics, MulticlassMetrics}
-import org.apache.spark.mllib.linalg.{Vector, Vectors}
-import org.apache.spark.mllib.regression.LabeledPoint
-import org.apache.spark.mllib.tree.GradientBoostedTrees
-import org.apache.spark.mllib.tree.configuration.BoostingStrategy
-import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.types.{DoubleType, StructType}
+import breeze.linalg.{max, min}
+import breeze.numerics.log
+import org.apache.log4j.{Level, Logger}
+import org.apache.spark.ml.classification.{LogisticRegression, NaiveBayes, RandomForestClassifier}
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.ml.linalg.DenseVector
 import org.apache.spark.sql._
-import org.apache.spark.{SparkConf, SparkContext}
-
-import scala.collection.mutable.ArrayBuffer
+import org.apache.spark.sql.types.DoubleType
 
 /**
   * Created by andrewkreimer on 6/28/16.
   */
 object SparkNumeraiDataFrameJob {
   def main(args: Array[String]) {
+    Logger.getLogger("org").setLevel(Level.OFF)
+    Logger.getLogger("akka").setLevel(Level.OFF)
+
     //configure Spark
     val spark = SparkSession.builder().appName("Spark SQL Example").master("local[*]").getOrCreate()
 
+    //get data
+    val (cols, trainData) = getTrainData(spark)
+    val testData = getTestData(spark, cols)
+
+    // split data
+    val (train: Dataset[Row], test: Dataset[Row]) = split(trainData)
+
+    //LR
+    println("LR:")
+    val lr = new LogisticRegression().setFeaturesCol("features").setLabelCol("label").setMaxIter(100)
+    val lrModel = lr.fit(train)
+    val lrPredictions = lrModel.transform(test)
+    lrPredictions.show(5)
+    calculateLogLoss(spark, lrPredictions)
+
+    //RF
+    println("RF:")
+    val rf = new RandomForestClassifier().setLabelCol("label").setFeaturesCol("features").setNumTrees(50)
+    val rfModel = rf.fit(train)
+    val rfPredictions = rfModel.transform(test)
+    rfPredictions.show(5)
+    calculateLogLoss(spark, rfPredictions)
+
+    /*
+    //GBC
+    println("GBC:")
+    val gbc = new GBTClassifier().setLabelCol("label").setFeaturesCol("features").setMaxIter(100)
+    val gbcModel = gbc.fit(train)
+    val gbcPredictions = gbcModel.transform(test)
+    gbcPredictions.show(5)
+    calculateLogLoss(spark, gbcPredictions)
+    */
+
+    //NB
+    println("NB:")
+    val nb = new NaiveBayes().setLabelCol("label").setFeaturesCol("features")
+    val nbModel = nb.fit(train)
+    val nbPredictions = nbModel.transform(test)
+    nbPredictions.show(5)
+    calculateLogLoss(spark, nbPredictions)
+
+    //Stacking
+    var stackedTrain = train.select("label")
+    stackedTrain = stackedTrain.join(lrPredictions.select("probability"))
+    stackedTrain.show(5)
+    stackedTrain = stackedTrain.withColumn("LR", lrPredictions("probability"))
+    stackedTrain = stackedTrain.withColumn("RF", rfPredictions("probability"))
+    stackedTrain = stackedTrain.withColumn("NB", nbPredictions("probability"))
+    stackedTrain.show(5)
+
+    /*
+    //make submission
+    val submission = gbcModel.transform(testData)
+
+    //write submission file
+    val created : String = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm").format(new Date())
+    val pw = new PrintWriter(new File("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/submissions/" + created + "_spark_GBC.csv"))
+    pw.write("t_id,probability\n")
+    submission.collect().foreach(row =>
+      pw.write(String.valueOf(row.get(0)))
+    )
+    pw.close()
+    */
+  }
+
+  /**
+    * Split for validation
+    *
+    * @param trainData - entire data set
+    * @return
+    */
+  def split(trainData: DataFrame): (Dataset[Row], Dataset[Row]) = {
+    println("Splitting data...")
+    val split = 0.8
+    val splits = trainData.randomSplit(Array(split, 1 - split), seed = 11L)
+
+    val train = splits(0).cache()
+    val test = splits(1)
+
+    (train, test)
+  }
+
+  /**
+    * Get train data
+    *
+    * @return
+    */
+  def getTrainData(spark : SparkSession): (Array[String], DataFrame) = {
     //load train data
     var trainData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_training_data.csv")
+    trainData = trainData.withColumn("target", trainData("target").cast(DoubleType))
 
     //convert to LabeledPoint structure
     val cols = Array.ofDim[String](trainData.columns.length - 1)
@@ -44,8 +126,16 @@ object SparkNumeraiDataFrameJob {
     trainData = trainData.withColumnRenamed("target", "label")
 
     //show train
+    println("Train Data:")
     trainData.show()
 
+    (cols, trainData)
+  }
+
+  /**
+    * Get test data, target is id
+    */
+  def getTestData(spark : SparkSession, cols : Array[String]): DataFrame = {
     //load test data
     var testData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_tournament_data.csv")
 
@@ -58,126 +148,34 @@ object SparkNumeraiDataFrameJob {
     )
 
     //show test
+    println("Test Data:")
     testData.show()
 
-    // split data
-    val split = 0.9
-    val splits = trainData.randomSplit(Array(split, 1 - split), seed = 11L)
-
-    val train = splits(0).cache()
-    val test = splits(1)
-
-    val lr = new LogisticRegression()
-      .setFeaturesCol("features")
-      .setLabelCol("label")
-      .setMaxIter(10)
-      .setRegParam(0.3)
-      .setElasticNetParam(0.8)
-
-    // Fit the model
-    val model = lr.fit(train)
-
-    // Print the coefficients and intercept for logistic regression
-    println(s"Coefficients: ${model.coefficients} Intercept: ${model.intercept}")
-
-    // Compute raw scores on the test set
-    val predictions = model.transform(test)
-
-    // Instantiate metrics object
-    // Select example rows to display.
-    predictions.select("prediction", "label", "features").show(5)
-
-    // Select (prediction, true label) and compute test error.
-    val evaluator = new MulticlassClassificationEvaluator()
-      .setLabelCol("label")
-      .setPredictionCol("prediction")
-      .setMetricName("accuracy")
-    val accuracy = evaluator.evaluate(predictions)
-    println("Test Error = " + (1.0 - accuracy))
+    testData
   }
 
-  //convert df to numbers
-  def toNumbers(df: DataFrame):DataFrame = {
-    df.columns.foreach(col =>
-      df.withColumn(col, df.col(col).cast(DoubleType))
-      .drop(col)
-      .withColumnRenamed(col, col)
-    )
+  /**
+    * Calculate log loss
+ *
+    * @param spark - SparkSession obj
+    * @param predictions - result of model transformation
+    */
+  def calculateLogLoss(spark: SparkSession, predictions: DataFrame): Unit = {
+    //log loss
+    val loss = spark.sparkContext.doubleAccumulator("LogLoss")
+    val trainCount = spark.sparkContext.longAccumulator("Global train examples count")
+    val maxmin = (p: Double) => max(min(p, 1.0 - 1e-14), 1e-14)
+    val logloss: ((Double, Double) => Double) = (p: Double, y: Double) => -(y * log(p) + (1 - y) * log(1 - p))
 
-    df
-  }
+    // Check log loss on training dataset
+    val predictionAndlabel = predictions.select("probability", "label")
 
-  def trainLRModel(testData: RDD[LabeledPoint], train: RDD[LabeledPoint], test: RDD[LabeledPoint]) = {
-    // train LR model
-    val lrAlgorithm = new LogisticRegressionWithLBFGS()
-    lrAlgorithm.setNumClasses(2)
-    lrAlgorithm.optimizer.setNumIterations(100000)
-    lrAlgorithm.optimizer.setRegParam(0.1)
-    lrAlgorithm.optimizer.setConvergenceTol(0.001)
-    lrAlgorithm.optimizer.setNumCorrections(100)
-    val lrModel = lrAlgorithm.run(train)
+    predictionAndlabel.foreach(row => {
+      loss.add(logloss(row.getAs[DenseVector](0).toArray.last, row.getAs[Double](1)))
+      trainCount.add(1)
+    })
 
-    // evaluate
-    val predictionAndLabels = test.map { point =>
-      val prediction = lrModel.predict(point.features)
-      (point.label, prediction)
-    }
-
-    // precision/recall
-    val metrics = new MulticlassMetrics(predictionAndLabels)
-    println("LR: Precision: " + metrics.precision + " Recall: " + metrics.recall)
-
-    //extract probabilities
-    lrModel.clearThreshold()
-
-    //make submission
-    val submission = testData.map { point =>
-      val prediction = lrModel.predict(point.features)
-      (point.label, prediction)
-    }
-
-    //write submission file
-    val collect: Array[(Double, Double)] = submission.collect()
-    val pw = new PrintWriter(new File("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/submissions/2016_07_03_spark_LR.csv"))
-    pw.write("t_id,probability\n")
-    collect.foreach(tuple => pw.write(tuple._1.toInt + "," + tuple._2 + "\n"))
-    pw.close()
-  }
-
-  def trainGBCModel(testData: RDD[LabeledPoint], train: RDD[LabeledPoint], test: RDD[LabeledPoint]) = {
-    // train GBC model
-    val boostingStrategy = BoostingStrategy.defaultParams("Classification")
-    boostingStrategy.setNumIterations(3) // Note: Use more iterations in practice.
-    //oostingStrategy.treeStrategy.numClasses = 2
-    //boostingStrategy.treeStrategy.maxDepth = 5
-    // Empty categoricalFeaturesInfo indicates all features are continuous.
-    //boostingStrategy.treeStrategy.categoricalFeaturesInfo = Map[Int, Int]()
-    val gbcmModel = GradientBoostedTrees.train(train, boostingStrategy)
-
-    // evaluate
-    val predictionAndLabels = test.map { point =>
-      val prediction = gbcmModel.predict(point.features)
-      (point.label, prediction)
-    }
-
-    // precision/recall
-    val metrics = new MulticlassMetrics(predictionAndLabels)
-    println("LR: Precision: " + metrics.precision + " Recall: " + metrics.recall)
-
-    //extract probabilities
-//    gbcmModel.clearThreshold()
-
-    //make submission
-    val submission = testData.map { point =>
-      val prediction = gbcmModel.predict(point.features)
-      (point.label, prediction)
-    }
-
-    //write submission file
-    val collect: Array[(Double, Double)] = submission.collect()
-    val pw = new PrintWriter(new File("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/submissions/2016_07_03_spark_GBC.csv"))
-    pw.write("t_id,probability\n")
-    collect.foreach(tuple => pw.write(tuple._1.toInt + "," + tuple._2 + "\n"))
-    pw.close()
+    val totalLoss = loss.value / trainCount.value
+    println("totalLoss: " + totalLoss)
   }
 }
