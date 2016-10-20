@@ -13,16 +13,17 @@ import org.apache.spark.sql.types.DoubleType
   * Created by andrewkreimer on 6/28/16.
   */
 object SparkNumeraiDataFrameJob {
+
   def main(args: Array[String]) {
     Logger.getLogger("org").setLevel(Level.OFF)
     Logger.getLogger("akka").setLevel(Level.OFF)
 
     //configure Spark
-    val spark = SparkSession.builder().appName("Spark SQL Example").master("local[*]").getOrCreate()
+    implicit val spark = SparkSession.builder().appName("Spark SQL Example").master("local[*]").getOrCreate()
 
     //get data
-    val (cols, trainData) = getTrainData(spark)
-    val testData = getTestData(spark, cols)
+    val (cols, trainData) = getTrainData
+    val testData = getTestData(cols)
 
     // split data
     val (train: Dataset[Row], test: Dataset[Row]) = split(trainData)
@@ -33,7 +34,7 @@ object SparkNumeraiDataFrameJob {
     val lrModel = lr.fit(train)
     val lrPredictions = lrModel.transform(test)
     lrPredictions.show(5)
-    calculateLogLoss(spark, lrPredictions)
+    calculateLogLoss(lrPredictions)
 
     //RF
     println("RF:")
@@ -41,7 +42,7 @@ object SparkNumeraiDataFrameJob {
     val rfModel = rf.fit(train)
     val rfPredictions = rfModel.transform(test)
     rfPredictions.show(5)
-    calculateLogLoss(spark, rfPredictions)
+    calculateLogLoss(rfPredictions)
 
     /*
     //GBC
@@ -59,15 +60,15 @@ object SparkNumeraiDataFrameJob {
     val nbModel = nb.fit(train)
     val nbPredictions = nbModel.transform(test)
     nbPredictions.show(5)
-    calculateLogLoss(spark, nbPredictions)
+    calculateLogLoss(nbPredictions)
 
     //Stacking
-    var stackedTrain = train.select("label")
-    stackedTrain = stackedTrain.join(lrPredictions.select("probability"))
+    var stackedTrain = lrPredictions.select("label", "probability")
+    stackedTrain = stackedTrain.join(rfPredictions.select("probability"))
     stackedTrain.show(5)
-    stackedTrain = stackedTrain.withColumn("LR", lrPredictions("probability"))
-    stackedTrain = stackedTrain.withColumn("RF", rfPredictions("probability"))
-    stackedTrain = stackedTrain.withColumn("NB", nbPredictions("probability"))
+//    stackedTrain = stackedTrain.withColumn("LR", lrPredictions("probability"))
+//    stackedTrain = stackedTrain.withColumn("RF", rfPredictions("probability"))
+//    stackedTrain = stackedTrain.withColumn("NB", nbPredictions("probability"))
     stackedTrain.show(5)
 
     /*
@@ -107,7 +108,7 @@ object SparkNumeraiDataFrameJob {
     *
     * @return
     */
-  def getTrainData(spark : SparkSession): (Array[String], DataFrame) = {
+  def getTrainData(implicit spark : SparkSession): (Array[String], DataFrame) = {
     //load train data
     var trainData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_training_data.csv")
     trainData = trainData.withColumn("target", trainData("target").cast(DoubleType))
@@ -135,7 +136,7 @@ object SparkNumeraiDataFrameJob {
   /**
     * Get test data, target is id
     */
-  def getTestData(spark : SparkSession, cols : Array[String]): DataFrame = {
+  def getTestData(cols : Array[String])(implicit spark : SparkSession) : DataFrame = {
     //load test data
     var testData = spark.read.format("csv").option("header", "true").option("inferSchema", "true").load("/Users/andrewkreimer/Documents/ML/Kaggle/Numerai/numerai_tournament_data.csv")
 
@@ -157,10 +158,9 @@ object SparkNumeraiDataFrameJob {
   /**
     * Calculate log loss
  *
-    * @param spark - SparkSession obj
     * @param predictions - result of model transformation
     */
-  def calculateLogLoss(spark: SparkSession, predictions: DataFrame): Unit = {
+  def calculateLogLoss(predictions: DataFrame)(implicit spark : SparkSession): Unit = {
     //log loss
     val loss = spark.sparkContext.doubleAccumulator("LogLoss")
     val trainCount = spark.sparkContext.longAccumulator("Global train examples count")
