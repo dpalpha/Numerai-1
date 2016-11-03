@@ -5,7 +5,7 @@ import breeze.numerics.log
 import org.apache.log4j.{Level, Logger}
 import org.apache.spark.ml.classification.{LogisticRegression, NaiveBayes, RandomForestClassifier}
 import org.apache.spark.ml.feature.VectorAssembler
-import org.apache.spark.ml.linalg.DenseVector
+import org.apache.spark.ml.linalg.{Vectors, DenseVector}
 import org.apache.spark.sql._
 import org.apache.spark.sql.types.DoubleType
 
@@ -19,7 +19,7 @@ object SparkNumeraiDataFrameJob {
     Logger.getLogger("akka").setLevel(Level.OFF)
 
     //configure Spark
-    implicit val spark = SparkSession.builder().appName("Spark SQL Example").master("local[*]").getOrCreate()
+    implicit val spark = SparkSession.builder().appName("Numerai").master("local[*]").getOrCreate()
 
     //get data
     val (cols, trainData) = getTrainData
@@ -32,15 +32,15 @@ object SparkNumeraiDataFrameJob {
     println("LR:")
     val lr = new LogisticRegression().setFeaturesCol("features").setLabelCol("label").setMaxIter(100)
     val lrModel = lr.fit(train)
-    val lrPredictions = lrModel.transform(test)
+    var lrPredictions = lrModel.transform(test)
     lrPredictions.show(5)
     calculateLogLoss(lrPredictions)
 
     //RF
     println("RF:")
-    val rf = new RandomForestClassifier().setLabelCol("label").setFeaturesCol("features").setNumTrees(50)
+    val rf = new RandomForestClassifier().setLabelCol("label").setFeaturesCol("features").setNumTrees(100)
     val rfModel = rf.fit(train)
-    val rfPredictions = rfModel.transform(test)
+    var rfPredictions = rfModel.transform(test)
     rfPredictions.show(5)
     calculateLogLoss(rfPredictions)
 
@@ -61,15 +61,67 @@ object SparkNumeraiDataFrameJob {
     val nbPredictions = nbModel.transform(test)
     nbPredictions.show(5)
     calculateLogLoss(nbPredictions)
+    nbPredictions.show()
 
     //Stacking
-    var stackedTrain = lrPredictions.select("label", "probability")
-    stackedTrain = stackedTrain.join(rfPredictions.select("probability"))
-    stackedTrain.show(5)
-//    stackedTrain = stackedTrain.withColumn("LR", lrPredictions("probability"))
-//    stackedTrain = stackedTrain.withColumn("RF", rfPredictions("probability"))
-//    stackedTrain = stackedTrain.withColumn("NB", nbPredictions("probability"))
-    stackedTrain.show(5)
+    val dfToCombine = Map("LR" -> rfPredictions, "RF" -> lrPredictions, "NB" -> nbPredictions)
+    val dfBeforeJoin = dfToCombine.map(entry => entry._1 -> entry._2.select("label", "features", "probability"))
+    val dfRenamedProbability = dfBeforeJoin.map(entry => entry._2.withColumnRenamed("probability", entry._1))
+
+    dfRenamedProbability.foreach(df => println("Before:" + df.count()))
+    dfRenamedProbability.foreach(_.show)
+
+    var stackedDf = dfRenamedProbability.reduce{
+      (df1 : DataFrame, df2: DataFrame) => df1.join(df2, Seq("label","features"))
+    }
+
+    println("After:" + stackedDf.count())
+
+    stackedDf = stackedDf.drop(stackedDf.col("features"))
+    stackedDf.show()
+
+    //flat the stacked data
+    stackedDf = new VectorAssembler().setInputCols(dfToCombine.keySet.toArray).setOutputCol("features").transform(stackedDf)
+    stackedDf.show()
+
+    stackedDf.select("features").take(5).foreach(println)
+
+    import spark.implicits._
+
+    implicit val myObjEncoder = org.apache.spark.sql.Encoders.kryo[org.apache.spark.ml.linalg.Vector]
+
+    //unbox probabilities for both labels
+    val df = stackedDf.map{row =>
+      val label = row.getAs[Double](0)
+      val lr = row.get(1).asInstanceOf[DenseVector]
+      val rf = row.get(2).asInstanceOf[DenseVector]
+      val nb = row.get(3).asInstanceOf[DenseVector]
+
+      Vectors.dense(label)
+    }
+
+    //show stacked data
+    stackedDf = stackedDf.drop(stackedDf.col("features"))
+    stackedDf.show()
+
+    //flat the stacked data
+    stackedDf = new VectorAssembler().setInputCols(dfToCombine.keySet.toArray).setOutputCol("features").transform(stackedDf)
+
+    dfToCombine.keySet.map(key =>
+      stackedDf = stackedDf.drop(stackedDf.col(key))
+    )
+
+    //show flatted data
+    stackedDf.show()
+
+    //Stacked LR
+    println("LR:")
+    val (stackedTrain: Dataset[Row], stackedTest: Dataset[Row]) = split(stackedDf)
+    val stackedLr = new LogisticRegression().setFeaturesCol("features").setLabelCol("label").setMaxIter(100)
+    val stackedLrModel = stackedLr.fit(stackedTrain)
+    var stackedLrPredictions = stackedLrModel.transform(stackedTest)
+    stackedLrPredictions.show(5)
+    calculateLogLoss(stackedLrPredictions)
 
     /*
     //make submission
