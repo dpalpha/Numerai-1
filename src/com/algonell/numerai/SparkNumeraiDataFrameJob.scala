@@ -32,7 +32,7 @@ object SparkNumeraiDataFrameJob {
     println("LR:")
     val lr = new LogisticRegression().setFeaturesCol("features").setLabelCol("label").setMaxIter(100)
     val lrModel = lr.fit(train)
-    var lrPredictions = lrModel.transform(test)
+    val lrPredictions = lrModel.transform(test)
     lrPredictions.show(5)
     calculateLogLoss(lrPredictions)
 
